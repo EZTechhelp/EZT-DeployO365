@@ -32,6 +32,7 @@ Automates silent install or removal of Office 365 editions using the Office Depl
 - Use this if you are a QA tester for this project or wish to test on a single machine
 - Its packaged as a self-executable for quick and easy testing and mobility
 - Configuration variables are set via a UI pop-up window that opens upon launching
+- WARNING: This is packaged with PS1 to EXE which is commonly flagged by AV systems. You can review all source code here to confirm saftey
 
 **[Powershell Source Code]()** 
 

@@ -3,7 +3,7 @@
     EZT-DeployO365
 
     .Version 
-    0.5.2
+    0.5.3
 
     .SYNOPSIS
     Automates silent install or removal of Office 365 editions using the Office Deployment Tookit, allowing custom config XML generation and removal of existing/older Office installs
@@ -168,66 +168,196 @@ if($Local_Test_Run){
 #----------------------------------------------
 
 #---------------------------------------------- 
+#region Load-Modules Function
+#----------------------------------------------
+function Load-Modules ($modules,$force,$update,$enablelogs,[switch]$local_import) {
+  $ExistingPaths = $Env:PSModulePath -split ';' -replace '\\$',''
+  if($local_import){
+    foreach($m in $modules){
+      if([System.IO.File]::Exists("$PSScriptRoot\Modules\$m\$m.psm1")){
+        $module_path = "$PSScriptRoot\Modules\$m\$m.psm1"
+      }
+      elseif([System.IO.File]::Exists("$($PSScriptRoot | split-path -parent)\Modules\$m\$m.psm1"))
+      {
+        $module_path = "$($PSScriptRoot | split-path -parent)\Modules\$m\$m.psm1"
+        
+      }elseif([System.IO.File]::Exists(".\Modules\$m\$m.psm1")){
+        $module_path = ".\Modules\$m\$m.psm1"
+      }else{
+        Write-Error "[Load-Module ERROR] Unable to find module $m -- PSScriptRoot: $PSScriptRoot" -ErrorVariable messageerror;if($enablelogs){$messageerror | Out-File -FilePath $logfile -Encoding unicode -Append}
+      }
+      try{
+        $module_root_path = Split-path $module_path -Parent
+        $Script:Script_Modules = new-object system.collections.stack
+        $null = $Script_Modules.push($module_path)
+        if ($ExistingPaths -notcontains $module_root_path) {
+          $Env:PSModulePath = $module_root_path + ';' + $Env:PSModulePath
+
+        }
+        $PSModuleAutoLoadingPreference = 'All'
+      }
+      catch{
+        Write-Error "[Load-Module ERROR] $_" -ErrorVariable messageerror;if($enablelogs){$messageerror | Out-File -FilePath $logfile -Encoding unicode -Append}
+        exit
+      }      
+    }
+    return
+  }
+  #Make sure we can download and install modules through NuGet
+  [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 
+  $PackageXML = Get-childitem "$env:ProgramFiles\WindowsPowershell\Modules\PackageManagement\*\*" -Filter 'PSGetModuleInfo.xml' -Recurse -force | select -Last 1
+  if($PackageXML -and ([System.IO.File]::Exists($PackageXML.FullName))){
+    $nugetxml = Import-Clixml $PackageXML.FullName
+    $PackageProvider = $nugetxml.PackageManagementProvider
+  }
+  if ($PackageProvider -eq 'NuGet') {
+    #if (Get-PackageProvider | Where-Object {$_.Name -eq 'Nuget'}) {
+    Write-Output ' | Required PackageProvider Nuget is installed.' -OutVariable message;if($enablelogs){$message | Out-File -FilePath $logfile -Encoding unicode -Append}
+  }
+  else{
+    
+    try{ 
+      Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force
+      Register-PackageSource -Name nuget.org -Location https://www.nuget.org/api/v2 -ProviderName NuGet -Trusted -Force
+    }
+    catch{Write-Error "[Load-Module ERROR] $_`n" -ErrorVariable messageerror;if($enablelogs){$messageerror | Out-File -FilePath $logfile -Encoding unicode -Append}}
+  }
+  #Install latest version of PowerShellGet
+  if(Get-Module 'PowershellGet' | Where-Object {$_.Version -lt '2.2.5'})
+  {   
+    Write-Output ' | PowershellGet version too low, updating to 2.2.5' -OutVariable message;if($enablelogs){$message | Out-File -FilePath $logfile -Encoding unicode -Append}
+    Install-Module -Name 'PowershellGet' -MinimumVersion '2.2.5' -Force 
+  }
+  $module_list = new-object system.collections.stack
+  foreach ($m in $modules){  
+    if (Get-Module | Where-Object {$_.Name -eq $m}){
+      Write-Output " | Required Module $m is imported." -OutVariable message;if($enablelogs){$message | Out-File -FilePath $logfile -Encoding unicode -Append}
+      if ($force){
+        Write-Output " | Force parameter applied - Installing $m" -OutVariable message;if($enablelogs){$message | Out-File -FilePath $logfile -Encoding unicode -Append}
+        Install-Module -Name $m -Scope AllUsers -Force -Verbose 
+      }
+    }
+    else {
+      #If module is not imported, but available on disk set module autoloading when needed/called 
+      foreach($path in $env:PSModulePath -split ";"){
+        if([System.IO.Directory]::Exists("$path\\$m")){
+          $Null = $module_list.push($("$path\\$m"))
+        }
+      }
+      if($module_list -match $m){       
+        $PSModuleAutoLoadingPreference = 'All'
+        if($Psversiontable.PSVersion.Major -gt 5){
+          Write-Output " | Importing Module $m" -OutVariable message;if($enablelogs){$message | Out-File -FilePath $logfile -Encoding unicode -Append}
+          Import-module $m
+        }else{
+          Write-Output " | Required Module $m is available on disk." -OutVariable message;if($enablelogs){$message | Out-File -FilePath $logfile -Encoding unicode -Append}
+        }
+        if($update){
+          Write-Output " | Updating module: $m" -OutVariable message;if($enablelogs){$message | Out-File -FilePath $logfile -Encoding unicode -Append}
+          Update-Module -Name $m -Force -ErrorAction Continue
+        }
+        if($force){
+          if($enablelogs){Write-Output " | Force parameter applied - Importing $m" | Out-File -FilePath $logfile -Encoding unicode -Append}
+          Import-Module $m -Verbose -force -Scope Global
+        }
+      }
+      else {
+        #If module is not imported, not available on disk, but is in online gallery then install and import
+        if (Find-Module -Name $m | Where-Object {$_.Name -eq $m}) {       
+          try{
+            Install-Module -Name $m -Force -Verbose -Scope AllUsers -AllowClobber
+            Import-Module $m -Verbose -force -Scope Global
+          }
+          catch{Write-Error "[Load-Module ERROR] $_" -ErrorVariable messageerror;if($enablelogs){$messageerror | Out-File -FilePath $logfile -Encoding unicode -Append}}      
+        }
+        else {
+          #If module is not imported, not available and not in online gallery then abort
+          Write-Error "[Load-Module ERROR] Required module $m not imported, not available and not in online gallery, exiting." -ErrorVariable messageerror;if($enablelogs){$messageerror | Out-File -FilePath $logfile -Encoding unicode -Append}
+          EXIT 1
+        }
+      }
+    }
+  } 
+}
+#---------------------------------------------- 
+#endregion Load-Modules Function
+#----------------------------------------------
+
+#----------------------------------------------
 #region Get-ThisScriptInfo Function
 #----------------------------------------------
-function Get-ThisScriptInfo
+function Get-thisScriptInfo
 {
-  $Invocation = (Get-Variable MyInvocation -Scope 1).Value
-  $ScriptPath = $PSCommandPath
-  if(!$ScriptPath)
-  {   
-    $ScriptPath = Split-Path -Parent -Path $MyInvocation.MyCommand
-    $thisScript = @{File = Get-ChildItem $ScriptPath; Contents = $Invocation.MyCommand}
+  param (
+    [switch]$VerboseDebug,
+    [string]$logfile_directory,
+    [string]$ScriptPath = $((Get-PSCallStack).ScriptName | where {$_ -notmatch '.psm1'} | select -First 1),
+    [string]$Script_Temp_Folder,
+    [switch]$No_Script_Temp_Folder
+  )
+  #$Script_File = $((Get-PSCallStack).ScriptName | where {$_ -notmatch '.psm1'})
+  $thisScript = @{File = Get-ChildItem $ScriptPath; Contents = (Get-Content $ScriptPath | out-string)}
+  if($thisScript.Contents -Match '^\s*\<#([\s\S]*?)#\>') 
+  {
+    $thisScript.Help = $Matches[1].Trim()
   }
-  else
-  {$thisScript = @{File = Get-ChildItem $ScriptPath; Contents = $Invocation.MyCommand.ScriptContents}}
-  If ($thisScript.Contents -Match '^\s*\<#([\s\S]*?)#\>') 
-  {$thisScript.Help = $Matches[1].Trim()}
   [RegEx]::Matches($thisScript.Help, "(^|[`r`n])\s*\.(.+)\s*[`r`n]|$") | ForEach-Object {
     If ($Caption) 
     {$thisScript.$Caption = $thisScript.Help.SubString($Start, $_.Index - $Start)}
     $Caption = $_.Groups[2].ToString().Trim()
     $Start = $_.Index + $_.Length
   }
-  $thisScript.Version = $thisScript.Version.Trim()
-  $thisScript.Name = $thisScript.Name.Trim()
-  $thisScript.credits = $thisScript.credits -split("`n") | ForEach-Object {$_.trim()}
-  $thisScript.SYNOPSIS = $thisScript.SYNOPSIS -split("`n") | ForEach-Object {$_.trim()}
-  $thisScript.Description = $thisScript.Description -split("`n") | ForEach-Object {$_.trim()}
-  $thisScript.Notes = $thisScript.Notes -split("`n") | ForEach-Object {$_.trim()}
-  $thisScript.Path = $thisScript.File.FullName
-  $thisScript.Folder = $thisScript.File.DirectoryName
-  $thisScript.BaseName = $thisScript.File.BaseName
-  $thisScript.Arguments = (($Invocation.Line + ' ') -Replace ('^.*\\\\' + $thisScript.File.Name.Replace('.', '\.') + "['"" ]"), '').Trim()
+  $thisScript.PSCallStack = Get-PSCallStack 
+  if($thisScript.Version){$thisScript.Version = $thisScript.Version.Trim()}
+  if($thisScript.Name){$thisScript.Name = $thisScript.Name.Trim()}else{$thisScript.Name = $thisScript.File.BaseName.Trim()}
+  if($thisScript.example){$thisScript.example = $thisScript.example -split("`n") | ForEach-Object {$_.trim()}}else{$thisScript.example = "None"}
+  if($thisScript.RequiredModules){$thisScript.RequiredModules = $thisScript.RequiredModules -split("`n") | ForEach-Object {$_.trim()}}else{$thisScript.RequiredModules = "None"}
+  if($thisScript.Author){$thisScript.Author = $thisScript.Author.Trim()}else{$thisScript.Author = "Unknown"}
+  if($thisScript.credits){$thisScript.credits = $thisScript.credits -split("`n") | ForEach-Object {$_.trim()}}else{$thisScript.credits = "None"}
+  if($thisScript.SYNOPSIS){$thisScript.SYNOPSIS = $thisScript.SYNOPSIS -split("`n") | ForEach-Object {$_.trim()}}else{$thisScript.SYNOPSIS = "None"}
+  if($thisScript.Description){$thisScript.Description = $thisScript.Description -split("`n") | ForEach-Object {$_.trim()}}else{$thisScript.Description = "None"}
+  if($thisScript.Notes){$thisScript.Notes = $thisScript.Notes -split("`n") | ForEach-Object {$_.trim()}}else{$thisScript.Notes = "None"}
+  $thisScript.Path = $thisScript.File.FullName; $thisScript.Folder = $thisScript.File.DirectoryName; $thisScript.BaseName = $thisScript.File.BaseName
+  $thisScript.Arguments = (($Invocation.Line + ' ') -Replace ('^.*\\' + $thisScript.File.Name.Replace('.', '\.') + "['"" ]"), '').Trim()
   [System.Collections.Generic.List[String]]$FX_NAMES = New-Object System.Collections.Generic.List[String]
   if(!([System.String]::IsNullOrWhiteSpace($thisScript.file)))
   { 
-    Select-String -Path $thisScript.file -Pattern 'function' |
+    Select-String -Path $thisScript.file -Pattern "function" |
     ForEach-Object {
-      [System.Text.RegularExpressions.Regex] $regexp = New-Object Regex('(function)( +)([\w-]+)')
+      [System.Text.RegularExpressions.Regex] $regexp = New-Object Regex("(function)( +)([\w-]+)")
       [System.Text.RegularExpressions.Match] $match = $regexp.Match("$_")
       if($match.Success)
       {
         $FX_NAMES.Add("$($match.Groups[3])")
       }  
     }
-    $thisScript.functions = $FX_NAMES.ToArray()   
+    $thisScript.functions = $FX_NAMES.ToArray()  
   }
-  $Script_Temp_Folder = "$env:TEMP\$($thisScript.Name)"
-  if(!(Test-Path $Script_Temp_Folder))
+  if(!$No_Script_Temp_Folder)
   {
-    try
+    if(!$Script_Temp_Folder)
     {
-      $null = New-Item $Script_Temp_Folder -ItemType Directory -Force
+      $Script_Temp_Folder = [System.IO.Path]::Combine($env:TEMP, $($thisScript.Name))
     }
-    catch
+    else
     {
-      Write-Output "[ERROR] Exception creating script temp directory $Script_Temp_Folder - $_" -OutVariable message;if($enablelogs){$message | Out-File -FilePath $logfile -Encoding unicode -Append}
+      $Script_Temp_Folder = [System.IO.Path]::Combine($Script_Temp_Folder, $($thisScript.Name))
     }
+    if(!(Test-Path $Script_Temp_Folder))
+    {
+      try
+      {
+        $null = New-Item $Script_Temp_Folder -ItemType Directory -Force
+      }
+      catch
+      {
+        Write-host "[ERROR] Exception creating script temp directory $Script_Temp_Folder - $_" -ForegroundColor Red
+      }
+    }
+    $thisScript.TempFolder = $Script_Temp_Folder
   }
   return $thisScript
 }
-
 #---------------------------------------------- 
 #endregion Get-ThisScriptInfo Function
 #----------------------------------------------
@@ -255,15 +385,16 @@ function Start-EZLogs
   if(!$Script_Name){$Script_Name = $($thisScript.Name)}
   if(!$Script_Description){$Script_Description = $($thisScript.SYNOPSIS)}
   if(!$Script_Version){$Script_Version = $($thisScript.Version)}
-  if(!$logfile_Directory){$Logfile_Directory = $($thisScript.TempFolder)}
   $script:logfile = [System.IO.Path]::Combine($logfile_directory, $logfile_name)
-  if (!(Test-Path -LiteralPath $logfile 2> $null))
-  {$null = New-Item -Path $logfile_directory -ItemType directory -Force}
+  if(!([system.io.file]::Exists($logfile)))
+  {
+    $null = New-Item -Path $logfile_directory -ItemType directory -Force
+  }
   $OriginalPref = $ProgressPreference
   $ProgressPreference = 'SilentlyContinue'
-  $Computer_Info = Get-WmiObject Win32_ComputerSystem | Select-Object *
+  $Computer_Info = Get-CimInstance Win32_ComputerSystem | Select-Object *
   $OS_Info = Get-CimInstance Win32_OperatingSystem | Select-Object *
-  $CPU_Name = (Get-WmiObject Win32_Processor -Property 'Name').name
+  $CPU_Name = (Get-CimInstance Win32_Processor -Property 'Name').name
   $ProgressPreference = $OriginalPref
   $logheader = @"
 `n###################### Logging Enabled ######################
@@ -279,7 +410,7 @@ CPU                  : $($CPU_Name)
 RAM                  : $([Math]::Round([int64]($computer_info.TotalPhysicalMemory)/1MB,2)) GB (Available: $([Math]::Round([int64]($OS_Info.FreePhysicalMemory)/1MB,2)) GB)
 Manufacturer         : $($computer_info.Manufacturer)
 Model                : $($computer_info.Model)
-Serial Number        : $((Get-WmiObject Win32_BIOS | Select-Object SerialNumber).SerialNumber)
+Serial Number        : $((Get-CimInstance Win32_BIOS | Select-Object SerialNumber).SerialNumber)
 Domain               : $($computer_info.Domain)
 Install Date         : $($OS_Info.InstallDate)
 Last Boot Up Time    : $($OS_Info.LastBootUpTime)
@@ -289,93 +420,12 @@ Windows Directory    : $($OS_Info.WindowsDirectory)
 "@
 
   Write-Output $logheader | Out-File -FilePath $logfile -Encoding unicode -Append
-  Write-Host "#### Executing $($thisScript.Name) - v$($thisScript.Version) ####" -ForegroundColor Black -BackGroundColor yellow
-  Write-Host " | $($thisScript.SYNOPSIS)"  
+  write-host "#### Executing $Script_Name - $Script_Version ####" -ForegroundColor Yellow
   Write-host " | Logging is enabled. Log file: $logfile"
   return $logfile
 }
 #---------------------------------------------- 
 #endregion Start EZLogs Function
-#----------------------------------------------
-
-#---------------------------------------------- 
-#region Load-Modules Function
-#----------------------------------------------
-function Load-Modules ($modules,$force,$update,$enablelogs) 
-{
-  #Make sure we can download and install modules through NuGet
-  [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-  if (Get-PackageProvider | Where-Object {$_.Name -eq 'Nuget'}) 
-  {
-    Write-Output ' | Required PackageProvider Nuget is installed.' -OutVariable message;if($enablelogs){$message | Out-File -FilePath $logfile -Encoding unicode -Append}
-  }
-  else
-  {
-    try
-    {
-      Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force
-      Register-PackageSource -Name nuget.org -Location https://www.nuget.org/api/v2 -ProviderName NuGet
-    }
-    catch
-    {
-      Write-Error "[Load-Module ERROR] $_`n" -ErrorVariable messageerror;if($enablelogs){$messageerror | Out-File -FilePath $logfile -Encoding unicode -Append}
-    }
-  }
-  #Install latest version of PowerShellGet
-  if (Get-Module 'PowershellGet' | Where-Object {$_.Version -lt '2.2.5'})
-  {
-    Write-Output ' | PowershellGet version too low, updating to 2.2.5' -OutVariable message;if($enablelogs){$message | Out-File -FilePath $logfile -Encoding unicode -Append}
-    Install-Module -Name 'PowershellGet' -MinimumVersion '2.2.5' -Force 
-  }
-  if(-not [string]::IsNullOrEmpty($modules)){
-    foreach ($m in $modules){  
-      if (Get-Module | Where-Object {$_.Name -eq $m}){
-        Write-Output " | Required Module $m is imported." -OutVariable message;if($enablelogs){$message | Out-File -FilePath $logfile -Encoding unicode -Append}
-        if ($force){
-          Write-Output " | Force parameter applied - Installing $m" -OutVariable message;if($enablelogs){$message | Out-File -FilePath $logfile -Encoding unicode -Append}
-          Install-Module -Name $m -Scope AllUsers -Force -Verbose 
-        }
-      }
-      else {
-        #If module is not imported, but available on disk set module autoloading when needed/called 
-        foreach($path in $env:PSModulePath -split ";"){
-          if(Test-Path -literalpath $Path){
-            $module_list += Get-ChildItem $path #using get-childitem against PSModulePath is much faster than using Get-Module -ListAvailable. Potential downside is it doesnt verify module is valid only that it exists
-          }
-        }
-        if($module_list -match $m){
-          Write-Output " | Required Module $m is available on disk." -OutVariable message;if($enablelogs){$message | Out-File -FilePath $logfile -Encoding unicode -Append}
-          $PSModuleAutoLoadingPreference = 'ModuleQualified'
-          if($update){
-            Write-Output " | Updating module: $m" -OutVariable message;if($enablelogs){$message | Out-File -FilePath $logfile -Encoding unicode -Append}
-            Update-Module -Name $m -Force -ErrorAction Continue
-          }
-          if($force){
-            if($enablelogs){Write-Output " | Force parameter applied - Importing $m" | Out-File -FilePath $logfile -Encoding unicode -Append}
-            Import-Module $m -Verbose -force -Scope Global
-          }
-        }
-        else {
-          #If module is not imported, not available on disk, but is in online gallery then install and import
-          if (Find-Module -Name $m | Where-Object {$_.Name -eq $m}) {
-            try{
-              Install-Module -Name $m -Force -Verbose -Scope AllUsers -AllowClobber
-              Import-Module $m -Verbose -force -Scope Global
-            }
-            catch{Write-Error "[Load-Module ERROR] $_" -ErrorVariable messageerror;if($enablelogs){$messageerror | Out-File -FilePath $logfile -Encoding unicode -Append}}      
-          }
-          else {
-            #If module is not imported, not available and not in online gallery then abort
-            Write-Error "[Load-Module ERROR] Required module $m not imported, not available and not in online gallery, exiting." -ErrorVariable messageerror;if($enablelogs){$messageerror | Out-File -FilePath $logfile -Encoding unicode -Append}
-            EXIT 1
-          }
-        }
-      }
-    }
-  }
-}
-#---------------------------------------------- 
-#endregion Load-Modules Function
 #----------------------------------------------
 
 #---------------------------------------------- 
@@ -387,7 +437,7 @@ function Write-EZLogs
   param (
     [string]$text,
     [switch]$VerboseDebug,
-    [switch]$enablelogs = ([System.Convert]::ToBoolean($enablelogs)),
+    [switch]$enablelogs = $true,
     [string]$logfile = $logfile,
     [switch]$Warning,
     $CatchError,
@@ -407,33 +457,40 @@ function Write-EZLogs
     [int]$linesbefore,
     [int]$linesafter
   )
-  if(!$logfile){$logfile = Start-EZlogs -thisScript $thisScript}
+
+  if(!$logfile){$logfile = $thisApp.Config.Log_file}
+  if(!$logfile){$logfile = Start-EZlogs}
+  if (!(Test-Path -LiteralPath $($logfile | split-path -Parent) 2> $null))
+  {$null = New-Item -Path $($logfile | split-path -Parent) -ItemType directory -Force}  
+  #if(!$logfile){write-ezlogs -showtime -NoNewLine -DateTimeFormat:$DateTimeFormat;Write-Warning ($wrn = "Log file was not specified. You must first run Start-EZLogs -Logfile_Directory to specify a log directory in order to use the logging functionality")}
   if($showtime -and !$logtime){$logtime = $true}else{$logtime = $false}
   if($foregroundcolor){$color = $foregroundcolor}
+  if($LinesBefore -ne 0){ for ($i = 0; $i -lt $LinesBefore; $i++) {write-host "`n" -NoNewline;if($enablelogs){write-output "" | Out-File -FilePath $logfile -Encoding unicode -Append -Force}}}
   if($BackgroundColor){$BackgroundColor_param = $BackgroundColor}else{$BackgroundColor_param = $null}
-  if($LinesBefore -ne 0){ for ($i = 0; $i -lt $LinesBefore; $i++) {write-host "`n" -NoNewline;if($enablelogs){write-output "" | Out-File -FilePath $logfile -Encoding unicode -Append}}}
-  if(-not [string]::IsNullOrEmpty($CatchError)){$text = "[ERROR] $text`:`n | $($CatchError.exception.message)`n | $($CatchError.InvocationInfo.positionmessage)`n | $($CatchError.ScriptStackTrace)`n";$color = "red"}
+  if($CatchError){$text = "[ERROR] $text`:`n | $($CatchError.exception.message)`n | $($CatchError.InvocationInfo.positionmessage)`n | $($CatchError.ScriptStackTrace)`n";$color = "red"}
+ 
+  #if($linesAfter){$text = "$text`n"}
   if($enablelogs)
   {
     if($VerboseDebug -and $warning)
     {
       $tmp = [System.IO.Path]::GetTempFileName();
-      Write-Host -Object "[$([datetime]::Now.ToString($DateTimeFormat))] " -NoNewline;Write-Warning ($wrn = "$text");Write-Output "[$(Get-Date -Format $DateTimeFormat)] [WARNING] $wrn" | Out-File -FilePath $logfile -Encoding unicode -Append -Verbose:$VerboseDebug 4>$tmp
-      $result = "[DEBUG] $(Get-Content $tmp)" | Out-File $logfile -Encoding unicode -Append;Remove-Item $tmp   
+      #write-ezlogs -showtime -NoNewLine -DateTimeFormat:$DateTimeFormat;Write-Warning ($wrn = "$text");Write-Output "[$(Get-Date -Format $DateTimeFormat)] [WARNING] $wrn" | Out-File -FilePath $logfile -Encoding unicode -Append -Verbose:$VerboseDebug 4>$tmp
+      $result = "[DEBUG] $(Get-Content $tmp)" | Out-File $logfile -Encoding unicode -Append -Force;Remove-Item $tmp   
     }
     elseif($Warning)
     {
       if($logOnly)
       {
         if($showtime){
-          Write-Output "[$(Get-Date -Format $DateTimeFormat)] " | Out-File -FilePath $logfile -Encoding unicode -Append -NoNewline
+          Write-Output "[$(Get-Date -Format $DateTimeFormat)] " | Out-File -FilePath $logfile -Encoding unicode -Append -NoNewline -Force
         }
         Write-Output "[WARNING] $text" | Out-File -FilePath $logfile -Encoding unicode -Append -NoNewline:$NoNewLine
       }
       else
       {
         if($showtime){
-          Write-Host -Object "[$([datetime]::Now.ToString($DateTimeFormat))] " -NoNewline;if($enablelogs){"[$([datetime]::Now.ToString($DateTimeFormat))] " | Out-File -FilePath $logfile -Encoding unicode -Append -NoNewline}
+          Write-Host -Object "[$([datetime]::Now.ToString($DateTimeFormat))] " -NoNewline;if($enablelogs){"[$([datetime]::Now.ToString($DateTimeFormat))] " | Out-File -FilePath $logfile -Encoding unicode -Append -NoNewline -Force}
         }
         Write-Warning ($wrn = "$text");Write-Output "[WARNING] $wrn" | Out-File -FilePath $logfile -Encoding unicode -Append
       }      
@@ -441,33 +498,36 @@ function Write-EZLogs
     elseif($VerboseDebug)
     {
       if($showtime){
-        Write-Host -Object "[$([datetime]::Now.ToString($DateTimeFormat))] " -NoNewline;if($enablelogs){"[$([datetime]::Now.ToString($DateTimeFormat))] " | Out-File -FilePath $logfile -Encoding unicode -Append -NoNewline}
+        Write-Host -Object "[$([datetime]::Now.ToString($DateTimeFormat))] " -NoNewline;if($enablelogs){"[$([datetime]::Now.ToString($DateTimeFormat))] " | Out-File -FilePath $logfile -Encoding unicode -Append -NoNewline -Force}
       }
       if($BackGroundColor){
-        Write-Host -Object "[DEBUG] $text" -ForegroundColor:Cyan -NoNewline:$NoNewLine -BackgroundColor:$BackGroundColor;if($enablelogs){"[DEBUG] $text" | Out-File -FilePath $logfile -Encoding unicode -Append -NoNewline:$NoNewLine}
+        Write-Host -Object "[DEBUG] $text" -ForegroundColor:Cyan -NoNewline:$NoNewLine -BackgroundColor:$BackGroundColor;if($enablelogs){"[DEBUG] $text" | Out-File -FilePath $logfile -Encoding unicode -Append -NoNewline:$NoNewLine -Force}
       }else{
-        Write-Host -Object "[DEBUG] $text" -ForegroundColor:Cyan -NoNewline:$NoNewLine;if($enablelogs){"[DEBUG] $text" | Out-File -FilePath $logfile -Encoding unicode -Append -NoNewline:$NoNewLine}
+        Write-Host -Object "[DEBUG] $text" -ForegroundColor:Cyan -NoNewline:$NoNewLine;if($enablelogs){"[DEBUG] $text" | Out-File -FilePath $logfile -Encoding unicode -Append -NoNewline:$NoNewLine -Force}
       }    
+      #write-ezlogs "[DEBUG] $text" -color Cyan -showtime:$showtime -LogFile:$logfile -LogTime:$logtime -NoNewLine:$NoNewLine -DateTimeFormat:$DateTimeFormat -BackGroundColor $BackgroundColor_param -StartSpaces:$StartSpaces -LinesBefore:$linesBefore -LinesAfter:$linesAfter
     }
     else
     {
       if($logOnly)
       {
         if($showtime){
-          Write-Output "[$(Get-Date -Format $DateTimeFormat)] " | Out-File -FilePath $logfile -Encoding unicode -Append -NoNewline
+          Write-Output "[$(Get-Date -Format $DateTimeFormat)] " | Out-File -FilePath $logfile -Encoding unicode -Append -NoNewline -Force
         }
         Write-Output "$text" | Out-File -FilePath $logfile -Encoding unicode -Append -NoNewline:$NoNewLine 
       }
       else
       {
         if($showtime){
-          Write-Host -Object "[$([datetime]::Now.ToString($DateTimeFormat))] " -NoNewline;if($enablelogs){"[$([datetime]::Now.ToString($DateTimeFormat))] " | Out-File -FilePath $logfile -Encoding unicode -Append -NoNewline}
+          Write-Host -Object "[$([datetime]::Now.ToString($DateTimeFormat))] " -NoNewline;if($enablelogs){"[$([datetime]::Now.ToString($DateTimeFormat))] " | Out-File -FilePath $logfile -Encoding unicode -Append -NoNewline -Force}
         }
         if($BackGroundColor){
-          Write-Host -Object $text -ForegroundColor:$Color -NoNewline:$NoNewLine -BackgroundColor:$BackGroundColor;if($enablelogs){$text | Out-File -FilePath $logfile -Encoding unicode -Append -NoNewline:$NoNewLine}
+          Write-Host -Object $text -ForegroundColor:$Color -NoNewline:$NoNewLine -BackgroundColor:$BackGroundColor;if($enablelogs){$text | Out-File -FilePath $logfile -Encoding unicode -Append -NoNewline:$NoNewLine -Force}
         }else{
-          Write-Host -Object $text -ForegroundColor:$Color -NoNewline:$NoNewLine;if($enablelogs){$text | Out-File -FilePath $logfile -Encoding unicode -Append -NoNewline:$NoNewLine}
+          Write-Host -Object $text -ForegroundColor:$Color -NoNewline:$NoNewLine;if($enablelogs){$text | Out-File -FilePath $logfile -Encoding unicode -Append -NoNewline:$NoNewLine -Force}
         }
+
+        #write-ezlogs $text -color:$color -showtime:$showtime -LogFile:$logfile -LogTime:$logtime -NoNewLine:$NoNewLine -DateTimeFormat:$DateTimeFormat -BackGroundColor $BackgroundColor_param -StartSpaces:$StartSpaces -LinesBefore:$linesBefore -LinesAfter:$linesAfter
       }
     }
   }
@@ -478,7 +538,8 @@ function Write-EZLogs
       if($showtime){
         Write-Host -Object "[$([datetime]::Now.ToString($DateTimeFormat))] " -NoNewline
       }
-      Write-Warning ($wrn = "$text")
+      Write-Warning ($wrn = "$text")  
+      #write-ezlogs -showtime:$showtime -NoNewLine -DateTimeFormat:$DateTimeFormat;Write-Warning ($wrn = "$text")
     }
     else
     {
@@ -490,9 +551,10 @@ function Write-EZLogs
       }else{
         Write-Host -Object $text -ForegroundColor:$Color -NoNewline:$NoNewLine
       }    
+      #write-ezlogs $text -color:$color -showtime:$showtime -NoNewLine:$NoNewLine -DateTimeFormat:$DateTimeFormat -BackGroundColor $BackgroundColor_param -StartSpaces:$StartSpaces -LinesBefore:$linesBefore -LinesAfter:$linesAfter
     }     
   }
-  if($LinesAfter -ne 0){ for ($i = 0; $i -lt $LinesAfter; $i++) {write-host "`n" -NoNewline;if($enablelogs){write-output "" | Out-File -FilePath $logfile -Encoding unicode -Append}}}
+  if($LinesAfter -ne 0){ for ($i = 0; $i -lt $LinesAfter; $i++) {write-host "`n" -NoNewline;if($enablelogs){write-output "" | Out-File -FilePath $logfile -Encoding unicode -Append -Force}}}
 }
 #---------------------------------------------- 
 #endregion Write-EZLogs Function
@@ -520,10 +582,6 @@ function Stop-EZLogs
     {
       $e_index++
       Write-Output "[ERROR $e_index Message] =========================================================================`n$($e.exception.message)`n$($e.InvocationInfo.positionmessage)`n$($e.ScriptStackTrace)`n`n" | Out-File -FilePath $logfile -Encoding unicode -Append
-    }
-    if($clearErrors)
-    {
-      $error.Clear()
     }
   }
   if($logOnly){Write-Output "`n======== Total Script Execution Time ========" | Out-File -FilePath $logfile -Encoding unicode -Append}else{Write-EZLogs "`n======== Total Script Execution Time ========" -enablelogs:$enablelogs -LogTime:$false}
@@ -1274,7 +1332,7 @@ function Invoke-Office365Setup
     elseif(!(Test-Path $ConfigurationXMLFile))
     {
       Write-ezlogs 'The configuration XML file is not a valid file. Please check the path and try again' -showtime -Warning
-      Stop-EZLogs -ErrorSummary -stoptimer -clearErrors -logOnly
+      Stop-EZLogs -ErrorSummary $error -stoptimer -clearErrors -logOnly
       Exit
     }
     else
@@ -1299,14 +1357,14 @@ function Invoke-Office365Setup
     Catch
     {
       write-ezlogs "[ERROR] An exception occured downloading ODT from $ODTInstallLink :`n | $($_.exception.message)`n | $($_.InvocationInfo.positionmessage)`n | $($_.ScriptStackTrace)`n" -color Red -showtime
-      Stop-Ezlogs -ErrorSummary -logOnly -stoptimer -clearErrors -enablelogs:([System.Convert]::ToBoolean($enablelogs))
+      Stop-Ezlogs -ErrorSummary $error -logOnly -stoptimer -clearErrors -enablelogs:([System.Convert]::ToBoolean($enablelogs))
       Exit
     }
   }
   else
   {
     write-ezlogs '[ERROR] Unable to get the ODT download link' -color Red -showtime
-    Stop-Ezlogs -ErrorSummary -logOnly -stoptimer -clearErrors -enablelogs:([System.Convert]::ToBoolean($enablelogs))
+    Stop-Ezlogs -ErrorSummary $error -logOnly -stoptimer -clearErrors -enablelogs:([System.Convert]::ToBoolean($enablelogs))
     Exit
   }
   
@@ -1327,7 +1385,6 @@ function Invoke-Office365Setup
     $OfficeInstaller = "$OfficeInstallDownloadPath\\setup.exe"
     $OfficeArguments = "/configure `"$ConfigurationXMLFile`""
     write-ezlogs " | Office Setup Command: $OfficeInstaller $OfficeArguments" -showtime 
-    $ODTLogFile = "$env:COMPUTERNAME-$(Get-Date -f 'yyyyMMdd')"
     $Proc = Start-Process -FilePath $OfficeInstaller -ArgumentList $OfficeArguments -Wait -PassThru -WindowStyle Hidden
     $proc | Wait-Process -Timeout 400 -ErrorAction Continue -ErrorVariable timeouted
     if ($timeouted)
@@ -1336,13 +1393,13 @@ function Invoke-Office365Setup
       $proc | Stop-Process 
       Write-ezlogs  "[ERROR] Process failed to finish before the timeout period and was canceled. Removing downloaded files and exiting. $timeouted" -Color red -showtime
       $Null = Remove-Item $OfficeInstallDownloadPath -Recurse -Force
-      Stop-Ezlogs -ErrorSummary -logOnly -stoptimer -clearErrors -enablelogs:([System.Convert]::ToBoolean($enablelogs))
+      Stop-Ezlogs -ErrorSummary $error -logOnly -stoptimer -clearErrors -enablelogs:([System.Convert]::ToBoolean($enablelogs))
       exit
     }
     elseif ($proc.ExitCode -ne 0)
     {
       Write-ezlogs "Unexpected process exit code ($($proc.ExitCode)). Halting further actions" -showtime -Warning
-      Stop-Ezlogs -ErrorSummary -logOnly -stoptimer -clearErrors -enablelogs:([System.Convert]::ToBoolean($enablelogs))
+      Stop-Ezlogs -ErrorSummary $error -logOnly -stoptimer -clearErrors -enablelogs:([System.Convert]::ToBoolean($enablelogs))
       exit
     }    
   }
@@ -1381,17 +1438,18 @@ function Invoke-Office365Setup
   }
   if($Copy_SetupLog)
   {
-    $ODTLogFileFound = Get-ChildItem $env:temp -Recurse -Filter "$ODTLogFile*.log"  -ErrorAction SilentlyContinue
+    #$ODTLogFile = "$env:COMPUTERNAME-"
+    $ODTLogFileFound = (Get-ChildItem $env:temp -Recurse -Filter "$env:COMPUTERNAME*.log" -ErrorAction SilentlyContinue).FullName
     if($ODTLogFileFound)
-    {
-      write-ezlogs "Copying Office 365 Setup log ($($ODTLogFileFound.FullName)) to directory ($Copy_SetupLog_directory)" -showtime
+    {    
       foreach($log in $ODTLogFileFound){
+        write-ezlogs "Copying Office 365 Setup log ($($log)) to directory ($Copy_SetupLog_directory)" -showtime
         $null = Copy-Item $log -Destination $Copy_SetupLog_directory -Force
       }
     }
     else
     {
-      write-ezlogs "Unable to find an Office 365 Setup log file matching $ODTLogFile" -showtime -Warning
+      write-ezlogs "Unable to find an Office 365 Setup log file matching $env:COMPUTERNAME*.log" -showtime -Warning
     }
   }
   if($Remove_Install_Office_Download_Path)
@@ -1426,7 +1484,10 @@ function Invoke-Office365Setup
 Use-RunAs
 $thisScript = Get-ThisScriptInfo
 $logfile = Start-Ezlogs -Logfile_Directory:$logfile_directory -Start_Timer -thisScript $thisScript
-Load-Modules -modules $Required_modules -force:$force_modules -update:$update_modules -enablelogs:([System.Convert]::ToBoolean($enablelogs))
+if($Required_modules){
+  Load-Modules -modules $Required_modules -force:$force_modules -update:$update_modules -enablelogs:([System.Convert]::ToBoolean($enablelogs))
+}
+
 $OfficeInstalled = $False
 write-ezlogs '#### Checking Office Installations ####' -linesbefore 1 -color yellow
 $Office_Installs = Get-OfficeVersion -ShowAllInstalledProducts | select ComputerName,DisplayName,KeyName,Version,Build,Bitness,ClientCulture,ClickToRun,ClickToRunUpdatesEnabled,ClickToRunUpdateUrl,Activate,DeviceBasedLicensing,SharedComputerLicensing,InstallPath,TeamsAddOn,ExcludedApps
